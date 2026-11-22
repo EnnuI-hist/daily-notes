@@ -6,9 +6,9 @@ import {
   ChevronRight,
   ChevronDown,
   Cloud,
-  CheckCircle2,
   Loader2,
   AlertCircle,
+  CheckCircle2,
 } from 'lucide-react';
 import {
   createPrivateGist,
@@ -78,8 +78,10 @@ export function App() {
   const debounceTimerRef = useRef<number | null>(null);
   const tasksRef = useRef(tasks);
   tasksRef.current = tasks;
+  const syncConfigRef = useRef(syncConfig);
+  syncConfigRef.current = syncConfig;
 
-  // Sync tasks to localStorage whenever tasks change
+  // Persist tasks to localStorage
   useEffect(() => {
     try {
       localStorage.setItem(TASKS_STORAGE_KEY, JSON.stringify(tasks));
@@ -88,68 +90,58 @@ export function App() {
     }
   }, [tasks]);
 
-  // Pull tasks from Gist and merge with local
-  const pullFromRemote = useCallback(
-    async (configToUse = syncConfig) => {
-      if (!configToUse || !configToUse.token || !configToUse.gistId) {
-        setSyncStatus('offline');
-        return;
-      }
+  // Pull from Gist (strictly reads without triggering push loop)
+  const pullFromRemote = useCallback(async (configToUse = syncConfigRef.current) => {
+    if (!configToUse || !configToUse.token || !configToUse.gistId) {
+      setSyncStatus('offline');
+      return;
+    }
 
-      try {
-        isPullingRef.current = true;
-        setSyncStatus('syncing');
+    try {
+      isPullingRef.current = true;
+      const remoteTasks = await fetchGistTasks(configToUse);
+      const merged = mergeTasks(tasksRef.current, remoteTasks);
 
-        const remoteTasks = await fetchGistTasks(configToUse);
-        const merged = mergeTasks(tasksRef.current, remoteTasks);
-
+      // Only update local state if tasks actually changed to avoid unnecessary re-renders
+      if (JSON.stringify(merged) !== JSON.stringify(tasksRef.current)) {
         setTasks(merged);
-        const now = Date.now();
-        setLastSyncedAt(now);
-        setSyncStatus('synced');
-
-        // Update last synced in config
-        const updatedConfig = { ...configToUse, lastSyncedAt: now };
-        setSyncConfig(updatedConfig);
-        localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(updatedConfig));
-      } catch (err) {
-        console.error('Pull failed', err);
-        setSyncStatus('error');
-      } finally {
-        setTimeout(() => {
-          isPullingRef.current = false;
-        }, 500);
       }
-    },
-    [syncConfig]
-  );
 
-  // Push local tasks to Gist
-  const pushToRemote = useCallback(
-    async (configToUse = syncConfig) => {
-      if (!configToUse || !configToUse.token || !configToUse.gistId) return;
+      const now = Date.now();
+      setLastSyncedAt(now);
+      setSyncStatus('synced');
+    } catch (err) {
+      console.error('Pull failed', err);
+      setSyncStatus('error');
+    } finally {
+      // Release lock after small delay
+      setTimeout(() => {
+        isPullingRef.current = false;
+      }, 300);
+    }
+  }, []);
 
-      try {
-        setSyncStatus('syncing');
-        await updateGistTasks(configToUse, tasksRef.current);
-        const now = Date.now();
-        setLastSyncedAt(now);
-        setSyncStatus('synced');
+  // Push local tasks to Gist (called strictly upon user modifications)
+  const pushToRemote = useCallback(async () => {
+    const config = syncConfigRef.current;
+    if (!config || !config.token || !config.gistId) return;
+    if (isPullingRef.current) return;
 
-        const updatedConfig = { ...configToUse, lastSyncedAt: now };
-        setSyncConfig(updatedConfig);
-        localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(updatedConfig));
-      } catch (err) {
-        console.error('Push failed', err);
-        setSyncStatus('error');
-      }
-    },
-    [syncConfig]
-  );
+    try {
+      setSyncStatus('syncing');
+      await updateGistTasks(config, tasksRef.current);
+      setLastSyncedAt(Date.now());
+      setSyncStatus('synced');
+    } catch (err) {
+      console.error('Push failed', err);
+      setSyncStatus('error');
+    }
+  }, []);
 
-  // Debounced push to Gist whenever tasks change locally
+  // Debounced push to Gist (1.8s debounce)
   const schedulePush = useCallback(() => {
-    if (!syncConfig || !syncConfig.token || !syncConfig.gistId) return;
+    const config = syncConfigRef.current;
+    if (!config || !config.token || !config.gistId) return;
     if (isPullingRef.current) return;
 
     if (debounceTimerRef.current) {
@@ -160,10 +152,11 @@ export function App() {
     debounceTimerRef.current = window.setTimeout(() => {
       pushToRemote();
     }, 1800);
-  }, [syncConfig, pushToRemote]);
+  }, [pushToRemote]);
 
-  // Handle Pairing URL from hash (#sync=...) on mount
+  // Initial load: parse hash (#sync=...) or pull once on mount
   useEffect(() => {
+    // 1. Check for pairing hash from QR code
     if (typeof window !== 'undefined' && window.location.hash.startsWith('#sync=')) {
       const hashData = window.location.hash.slice(6);
       const pairing = decodeSyncPairing(hashData);
@@ -176,46 +169,28 @@ export function App() {
         };
 
         setSyncConfig(newConfig);
+        syncConfigRef.current = newConfig;
         localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(newConfig));
 
         // Immediately clean secret hash from address bar and history
         window.history.replaceState(null, '', window.location.pathname);
 
-        setToastMessage('Синхронизация успешно привязана с ПК! 🚀');
-        setTimeout(() => setToastMessage(null), 3500);
+        setToastMessage('Синхронизация привязана с ПК! 🚀');
+        setTimeout(() => setToastMessage(null), 3000);
 
-        // Immediately pull remote tasks
+        // Pull immediately once
         pullFromRemote(newConfig);
+        return;
       }
     }
-  }, [pullFromRemote]);
 
-  // Initial pull and event listeners for window focus & visibilitychange
-  useEffect(() => {
-    if (syncConfig) {
-      pullFromRemote(syncConfig);
+    // 2. If already configured, pull once on initial mount
+    const savedConfig = syncConfigRef.current;
+    if (savedConfig && savedConfig.token && savedConfig.gistId) {
+      pullFromRemote(savedConfig);
     }
-
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible' && syncConfig) {
-        pullFromRemote();
-      }
-    };
-
-    const handleFocus = () => {
-      if (syncConfig) {
-        pullFromRemote();
-      }
-    };
-
-    window.addEventListener('visibilitychange', handleVisibilityChange);
-    window.addEventListener('focus', handleFocus);
-
-    return () => {
-      window.removeEventListener('visibilitychange', handleVisibilityChange);
-      window.removeEventListener('focus', handleFocus);
-    };
-  }, [syncConfig, pullFromRemote]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Connect handler in Modal
   const handleConnectSync = async (token: string, existingGistId?: string) => {
@@ -238,6 +213,7 @@ export function App() {
     };
 
     setSyncConfig(newConfig);
+    syncConfigRef.current = newConfig;
     localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(newConfig));
     setSyncStatus('synced');
     setLastSyncedAt(Date.now());
@@ -245,13 +221,17 @@ export function App() {
     // Push initial merged state to gist
     await updateGistTasks(newConfig, tasksRef.current);
 
-    setToastMessage('Синхронизация успешно подключена!');
+    setToastMessage('Синхронизация подключена!');
     setTimeout(() => setToastMessage(null), 3000);
   };
 
   // Disconnect handler
   const handleDisconnectSync = () => {
+    if (debounceTimerRef.current) {
+      window.clearTimeout(debounceTimerRef.current);
+    }
     setSyncConfig(null);
+    syncConfigRef.current = null;
     localStorage.removeItem(SYNC_CONFIG_KEY);
     setSyncStatus('offline');
     setLastSyncedAt(undefined);
@@ -260,11 +240,11 @@ export function App() {
     setTimeout(() => setToastMessage(null), 2500);
   };
 
-  // Force sync action
+  // Force sync action from Modal
   const handleForceSync = async () => {
     await pullFromRemote();
     await pushToRemote();
-    setToastMessage('Данные синхронизированы!');
+    setToastMessage('Синхронизировано!');
     setTimeout(() => setToastMessage(null), 2500);
   };
 
@@ -272,7 +252,7 @@ export function App() {
   const activeTasks = tasks.filter(t => !t.completed && !t.deleted);
   const archivedTasks = tasks.filter(t => t.completed && !t.deleted);
 
-  // Add task on Enter
+  // Add task on Enter (user action)
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter') {
       const trimmed = inputVal.trim();
@@ -293,7 +273,7 @@ export function App() {
     }
   };
 
-  // Complete task with smooth disappearing animation
+  // Complete task with smooth disappearing animation (user action)
   const handleComplete = (id: string) => {
     setCompletingIds(prev => new Set(prev).add(id));
 
@@ -315,7 +295,7 @@ export function App() {
     }, 320);
   };
 
-  // Restore task from archive back to active list
+  // Restore task from archive back to active list (user action)
   const handleRestore = (id: string) => {
     const now = Date.now();
     setTasks(prev =>
@@ -326,7 +306,7 @@ export function App() {
     schedulePush();
   };
 
-  // Delete task (soft delete tombstone so deletion syncs to other devices)
+  // Delete task (soft delete tombstone so deletion syncs to other devices) (user action)
   const handleDelete = (id: string) => {
     const now = Date.now();
     setTasks(prev =>
@@ -337,32 +317,18 @@ export function App() {
     schedulePush();
   };
 
-  // Helper for Status indicator
+  // Compact static Cloud Indicator in header (fixed size w-8 h-8, no layout shift or jumping text)
   const renderSyncIndicator = () => {
     if (!syncConfig) {
       return (
         <button
           type="button"
           onClick={() => setIsSyncModalOpen(true)}
-          className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs text-zinc-400 dark:text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-900 transition-colors cursor-pointer select-none"
-          title="Настроить синхронизацию с телефоном"
+          className="w-8 h-8 rounded-full flex items-center justify-center text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-900 transition-colors cursor-pointer select-none"
+          title="Синхронизация отключена (нажмите для настройки)"
+          aria-label="Синхронизация отключена"
         >
-          <Cloud className="w-3.5 h-3.5" />
-          <span>Офлайн</span>
-        </button>
-      );
-    }
-
-    if (syncStatus === 'syncing') {
-      return (
-        <button
-          type="button"
-          onClick={() => setIsSyncModalOpen(true)}
-          className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs text-indigo-600 dark:text-indigo-400 bg-indigo-50/60 dark:bg-indigo-950/40 transition-colors cursor-pointer select-none"
-          title="Синхронизация данных..."
-        >
-          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-          <span>Сохранение...</span>
+          <Cloud className="w-4 h-4 opacity-40 hover:opacity-80 transition-opacity" />
         </button>
       );
     }
@@ -372,8 +338,8 @@ export function App() {
         <button
           type="button"
           onClick={() => setIsSyncModalOpen(true)}
-          className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs text-rose-600 dark:text-rose-400 bg-rose-50/60 dark:bg-rose-950/40 transition-colors cursor-pointer select-none"
-          title="Ошибка синхронизации (клик для настроек)"
+          className="flex items-center gap-1.5 px-2.5 h-8 rounded-full text-xs text-rose-600 dark:text-rose-400 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-900/50 hover:bg-rose-100 dark:hover:bg-rose-950/70 transition-colors cursor-pointer select-none"
+          title="Ошибка синхронизации (нажмите для проверки настроек)"
         >
           <AlertCircle className="w-3.5 h-3.5" />
           <span>Ошибка</span>
@@ -381,15 +347,31 @@ export function App() {
       );
     }
 
+    if (syncStatus === 'syncing') {
+      return (
+        <button
+          type="button"
+          onClick={() => setIsSyncModalOpen(true)}
+          className="w-8 h-8 rounded-full flex items-center justify-center text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-900 transition-colors cursor-pointer select-none"
+          title="Сохранение в Gist..."
+          aria-label="Сохранение"
+        >
+          <Loader2 className="w-4 h-4 animate-spin text-zinc-400" />
+        </button>
+      );
+    }
+
+    // Synced: calm cloud with a tiny subtle green dot
     return (
       <button
         type="button"
         onClick={() => setIsSyncModalOpen(true)}
-        className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs text-zinc-400 dark:text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-900 transition-colors cursor-pointer select-none"
-        title="Синхронизировано (клик для настроек или QR-кода)"
+        className="relative w-8 h-8 rounded-full flex items-center justify-center text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-900 transition-colors cursor-pointer select-none"
+        title="Синхронизировано (нажмите для настроек или QR-кода)"
+        aria-label="Синхронизировано"
       >
-        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
-        <span className="hidden sm:inline">Синхронизировано</span>
+        <Cloud className="w-4 h-4" />
+        <span className="absolute bottom-1.5 right-1.5 w-1.5 h-1.5 rounded-full bg-emerald-500" />
       </button>
     );
   };
@@ -397,8 +379,8 @@ export function App() {
   return (
     <div className="min-h-screen bg-[#fafafa] dark:bg-[#0c0c0e] text-zinc-900 dark:text-zinc-100 flex flex-col justify-between selection:bg-zinc-200 dark:selection:bg-zinc-800 transition-colors">
       <main className="w-full max-w-xl mx-auto px-6 pt-10 sm:pt-16 pb-12 flex-1">
-        {/* Header with Sync Status Indicator */}
-        <div className="flex items-center justify-end mb-8">
+        {/* Header with Compact Static Sync Icon */}
+        <div className="flex items-center justify-end mb-8 h-8">
           {renderSyncIndicator()}
         </div>
 
