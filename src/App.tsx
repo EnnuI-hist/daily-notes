@@ -1,18 +1,48 @@
-import React, { useState, useEffect, useRef } from 'react';
-import type { Task } from './types';
-import { Check, X, ChevronRight, ChevronDown } from 'lucide-react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import type { Task, SyncConfig, SyncStatus } from './types';
+import {
+  Check,
+  X,
+  ChevronRight,
+  ChevronDown,
+  Cloud,
+  CheckCircle2,
+  Loader2,
+  AlertCircle,
+} from 'lucide-react';
+import {
+  createPrivateGist,
+  fetchGistTasks,
+  updateGistTasks,
+  mergeTasks,
+  decodeSyncPairing,
+} from './services/gistSync';
+import { SyncModal } from './components/SyncModal';
 
-const STORAGE_KEY = 'mindflow_minimal_tasks_v2';
+const TASKS_STORAGE_KEY = 'mindflow_minimal_tasks_v2';
+const SYNC_CONFIG_KEY = 'mindflow_sync_config_v1';
 
 const INITIAL_TASKS: Task[] = [
-  { id: '1', text: 'Записать главную мысль или задачу', completed: false, createdAt: Date.now() - 2000 },
-  { id: '2', text: 'Попробовать нажать на чекбокс слева', completed: false, createdAt: Date.now() - 1000 },
+  {
+    id: '1',
+    text: 'Записать главную мысль или задачу',
+    completed: false,
+    createdAt: Date.now() - 2000,
+    updatedAt: Date.now() - 2000,
+  },
+  {
+    id: '2',
+    text: 'Попробовать нажать на чекбокс слева',
+    completed: false,
+    createdAt: Date.now() - 1000,
+    updatedAt: Date.now() - 1000,
+  },
 ];
 
 export function App() {
   const [tasks, setTasks] = useState<Task[]>(() => {
     try {
-      const saved = localStorage.getItem(STORAGE_KEY);
+      const saved = localStorage.getItem(TASKS_STORAGE_KEY);
       if (saved) return JSON.parse(saved);
     } catch {
       // ignore
@@ -20,22 +50,227 @@ export function App() {
     return INITIAL_TASKS;
   });
 
+  const [syncConfig, setSyncConfig] = useState<SyncConfig | null>(() => {
+    try {
+      const saved = localStorage.getItem(SYNC_CONFIG_KEY);
+      if (saved) return JSON.parse(saved);
+    } catch {
+      // ignore
+    }
+    return null;
+  });
+
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>(() =>
+    syncConfig ? 'synced' : 'offline'
+  );
+  const [lastSyncedAt, setLastSyncedAt] = useState<number | undefined>(
+    syncConfig?.lastSyncedAt
+  );
+
   const [inputVal, setInputVal] = useState('');
   const [showArchive, setShowArchive] = useState(false);
   const [completingIds, setCompletingIds] = useState<Set<string>>(new Set());
-  const inputRef = useRef<HTMLInputElement>(null);
+  const [isSyncModalOpen, setIsSyncModalOpen] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
 
-  // Sync to localStorage
+  const inputRef = useRef<HTMLInputElement>(null);
+  const isPullingRef = useRef(false);
+  const debounceTimerRef = useRef<number | null>(null);
+  const tasksRef = useRef(tasks);
+  tasksRef.current = tasks;
+
+  // Sync tasks to localStorage whenever tasks change
   useEffect(() => {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(tasks));
+      localStorage.setItem(TASKS_STORAGE_KEY, JSON.stringify(tasks));
     } catch (e) {
       console.error('Failed to save tasks', e);
     }
   }, [tasks]);
 
-  const activeTasks = tasks.filter(t => !t.completed);
-  const archivedTasks = tasks.filter(t => t.completed);
+  // Pull tasks from Gist and merge with local
+  const pullFromRemote = useCallback(
+    async (configToUse = syncConfig) => {
+      if (!configToUse || !configToUse.token || !configToUse.gistId) {
+        setSyncStatus('offline');
+        return;
+      }
+
+      try {
+        isPullingRef.current = true;
+        setSyncStatus('syncing');
+
+        const remoteTasks = await fetchGistTasks(configToUse);
+        const merged = mergeTasks(tasksRef.current, remoteTasks);
+
+        setTasks(merged);
+        const now = Date.now();
+        setLastSyncedAt(now);
+        setSyncStatus('synced');
+
+        // Update last synced in config
+        const updatedConfig = { ...configToUse, lastSyncedAt: now };
+        setSyncConfig(updatedConfig);
+        localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(updatedConfig));
+      } catch (err) {
+        console.error('Pull failed', err);
+        setSyncStatus('error');
+      } finally {
+        setTimeout(() => {
+          isPullingRef.current = false;
+        }, 500);
+      }
+    },
+    [syncConfig]
+  );
+
+  // Push local tasks to Gist
+  const pushToRemote = useCallback(
+    async (configToUse = syncConfig) => {
+      if (!configToUse || !configToUse.token || !configToUse.gistId) return;
+
+      try {
+        setSyncStatus('syncing');
+        await updateGistTasks(configToUse, tasksRef.current);
+        const now = Date.now();
+        setLastSyncedAt(now);
+        setSyncStatus('synced');
+
+        const updatedConfig = { ...configToUse, lastSyncedAt: now };
+        setSyncConfig(updatedConfig);
+        localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(updatedConfig));
+      } catch (err) {
+        console.error('Push failed', err);
+        setSyncStatus('error');
+      }
+    },
+    [syncConfig]
+  );
+
+  // Debounced push to Gist whenever tasks change locally
+  const schedulePush = useCallback(() => {
+    if (!syncConfig || !syncConfig.token || !syncConfig.gistId) return;
+    if (isPullingRef.current) return;
+
+    if (debounceTimerRef.current) {
+      window.clearTimeout(debounceTimerRef.current);
+    }
+
+    setSyncStatus('syncing');
+    debounceTimerRef.current = window.setTimeout(() => {
+      pushToRemote();
+    }, 1800);
+  }, [syncConfig, pushToRemote]);
+
+  // Handle Pairing URL from hash (#sync=...) on mount
+  useEffect(() => {
+    if (typeof window !== 'undefined' && window.location.hash.startsWith('#sync=')) {
+      const hashData = window.location.hash.slice(6);
+      const pairing = decodeSyncPairing(hashData);
+
+      if (pairing && pairing.token && pairing.gistId) {
+        const newConfig: SyncConfig = {
+          token: pairing.token,
+          gistId: pairing.gistId,
+          lastSyncedAt: Date.now(),
+        };
+
+        setSyncConfig(newConfig);
+        localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(newConfig));
+
+        // Immediately clean secret hash from address bar and history
+        window.history.replaceState(null, '', window.location.pathname);
+
+        setToastMessage('Синхронизация успешно привязана с ПК! 🚀');
+        setTimeout(() => setToastMessage(null), 3500);
+
+        // Immediately pull remote tasks
+        pullFromRemote(newConfig);
+      }
+    }
+  }, [pullFromRemote]);
+
+  // Initial pull and event listeners for window focus & visibilitychange
+  useEffect(() => {
+    if (syncConfig) {
+      pullFromRemote(syncConfig);
+    }
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible' && syncConfig) {
+        pullFromRemote();
+      }
+    };
+
+    const handleFocus = () => {
+      if (syncConfig) {
+        pullFromRemote();
+      }
+    };
+
+    window.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('focus', handleFocus);
+
+    return () => {
+      window.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('focus', handleFocus);
+    };
+  }, [syncConfig, pullFromRemote]);
+
+  // Connect handler in Modal
+  const handleConnectSync = async (token: string, existingGistId?: string) => {
+    let gistId = existingGistId;
+
+    if (!gistId) {
+      // Create new private Gist
+      gistId = await createPrivateGist(token, tasksRef.current);
+    } else {
+      // Test fetch from existing Gist and merge
+      const remote = await fetchGistTasks({ token, gistId });
+      const merged = mergeTasks(tasksRef.current, remote);
+      setTasks(merged);
+    }
+
+    const newConfig: SyncConfig = {
+      token,
+      gistId,
+      lastSyncedAt: Date.now(),
+    };
+
+    setSyncConfig(newConfig);
+    localStorage.setItem(SYNC_CONFIG_KEY, JSON.stringify(newConfig));
+    setSyncStatus('synced');
+    setLastSyncedAt(Date.now());
+
+    // Push initial merged state to gist
+    await updateGistTasks(newConfig, tasksRef.current);
+
+    setToastMessage('Синхронизация успешно подключена!');
+    setTimeout(() => setToastMessage(null), 3000);
+  };
+
+  // Disconnect handler
+  const handleDisconnectSync = () => {
+    setSyncConfig(null);
+    localStorage.removeItem(SYNC_CONFIG_KEY);
+    setSyncStatus('offline');
+    setLastSyncedAt(undefined);
+    setIsSyncModalOpen(false);
+    setToastMessage('Синхронизация отключена');
+    setTimeout(() => setToastMessage(null), 2500);
+  };
+
+  // Force sync action
+  const handleForceSync = async () => {
+    await pullFromRemote();
+    await pushToRemote();
+    setToastMessage('Данные синхронизированы!');
+    setTimeout(() => setToastMessage(null), 2500);
+  };
+
+  // Filter out deleted tasks (tombstones) for display
+  const activeTasks = tasks.filter(t => !t.completed && !t.deleted);
+  const archivedTasks = tasks.filter(t => t.completed && !t.deleted);
 
   // Add task on Enter
   const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -43,15 +278,18 @@ export function App() {
       const trimmed = inputVal.trim();
       if (!trimmed) return;
 
+      const now = Date.now();
       const newTask: Task = {
-        id: `t-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        id: `t-${now}-${Math.random().toString(36).slice(2, 6)}`,
         text: trimmed,
         completed: false,
-        createdAt: Date.now(),
+        createdAt: now,
+        updatedAt: now,
       };
 
       setTasks(prev => [newTask, ...prev]);
       setInputVal('');
+      schedulePush();
     }
   };
 
@@ -60,9 +298,12 @@ export function App() {
     setCompletingIds(prev => new Set(prev).add(id));
 
     setTimeout(() => {
+      const now = Date.now();
       setTasks(prev =>
         prev.map(t =>
-          t.id === id ? { ...t, completed: true, completedAt: Date.now() } : t
+          t.id === id
+            ? { ...t, completed: true, completedAt: now, updatedAt: now }
+            : t
         )
       );
       setCompletingIds(prev => {
@@ -70,24 +311,97 @@ export function App() {
         next.delete(id);
         return next;
       });
+      schedulePush();
     }, 320);
   };
 
   // Restore task from archive back to active list
   const handleRestore = (id: string) => {
+    const now = Date.now();
     setTasks(prev =>
-      prev.map(t => (t.id === id ? { ...t, completed: false } : t))
+      prev.map(t =>
+        t.id === id ? { ...t, completed: false, updatedAt: now } : t
+      )
     );
+    schedulePush();
   };
 
-  // Delete task
+  // Delete task (soft delete tombstone so deletion syncs to other devices)
   const handleDelete = (id: string) => {
-    setTasks(prev => prev.filter(t => t.id !== id));
+    const now = Date.now();
+    setTasks(prev =>
+      prev.map(t =>
+        t.id === id ? { ...t, deleted: true, updatedAt: now } : t
+      )
+    );
+    schedulePush();
+  };
+
+  // Helper for Status indicator
+  const renderSyncIndicator = () => {
+    if (!syncConfig) {
+      return (
+        <button
+          type="button"
+          onClick={() => setIsSyncModalOpen(true)}
+          className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs text-zinc-400 dark:text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-900 transition-colors cursor-pointer select-none"
+          title="Настроить синхронизацию с телефоном"
+        >
+          <Cloud className="w-3.5 h-3.5" />
+          <span>Офлайн</span>
+        </button>
+      );
+    }
+
+    if (syncStatus === 'syncing') {
+      return (
+        <button
+          type="button"
+          onClick={() => setIsSyncModalOpen(true)}
+          className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs text-indigo-600 dark:text-indigo-400 bg-indigo-50/60 dark:bg-indigo-950/40 transition-colors cursor-pointer select-none"
+          title="Синхронизация данных..."
+        >
+          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+          <span>Сохранение...</span>
+        </button>
+      );
+    }
+
+    if (syncStatus === 'error') {
+      return (
+        <button
+          type="button"
+          onClick={() => setIsSyncModalOpen(true)}
+          className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs text-rose-600 dark:text-rose-400 bg-rose-50/60 dark:bg-rose-950/40 transition-colors cursor-pointer select-none"
+          title="Ошибка синхронизации (клик для настроек)"
+        >
+          <AlertCircle className="w-3.5 h-3.5" />
+          <span>Ошибка</span>
+        </button>
+      );
+    }
+
+    return (
+      <button
+        type="button"
+        onClick={() => setIsSyncModalOpen(true)}
+        className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs text-zinc-400 dark:text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-900 transition-colors cursor-pointer select-none"
+        title="Синхронизировано (клик для настроек или QR-кода)"
+      >
+        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-500" />
+        <span className="hidden sm:inline">Синхронизировано</span>
+      </button>
+    );
   };
 
   return (
     <div className="min-h-screen bg-[#fafafa] dark:bg-[#0c0c0e] text-zinc-900 dark:text-zinc-100 flex flex-col justify-between selection:bg-zinc-200 dark:selection:bg-zinc-800 transition-colors">
-      <main className="w-full max-w-xl mx-auto px-6 pt-16 sm:pt-24 pb-12 flex-1">
+      <main className="w-full max-w-xl mx-auto px-6 pt-10 sm:pt-16 pb-12 flex-1">
+        {/* Header with Sync Status Indicator */}
+        <div className="flex items-center justify-end mb-8">
+          {renderSyncIndicator()}
+        </div>
+
         {/* Top Minimal Input */}
         <div className="mb-10">
           <input
@@ -126,7 +440,9 @@ export function App() {
                       type="button"
                       onClick={() => handleComplete(task.id)}
                       className={`shrink-0 w-4.5 h-4.5 rounded-full border border-zinc-300 dark:border-zinc-700 hover:border-zinc-500 dark:hover:border-zinc-400 flex items-center justify-center transition-all cursor-pointer ${
-                        isFading ? 'bg-zinc-900 border-zinc-900 dark:bg-zinc-100 dark:border-zinc-100' : ''
+                        isFading
+                          ? 'bg-zinc-900 border-zinc-900 dark:bg-zinc-100 dark:border-zinc-100'
+                          : ''
                       }`}
                       aria-label="Завершить задачу"
                     >
@@ -218,6 +534,28 @@ export function App() {
             )}
           </div>
         </footer>
+      )}
+
+      {/* Sync Configuration & QR Pairing Modal */}
+      <SyncModal
+        isOpen={isSyncModalOpen}
+        onClose={() => setIsSyncModalOpen(false)}
+        config={syncConfig}
+        onConnect={handleConnectSync}
+        onDisconnect={handleDisconnectSync}
+        onForceSync={handleForceSync}
+        isSyncing={syncStatus === 'syncing'}
+        lastSyncedAt={lastSyncedAt}
+      />
+
+      {/* Floating Toast Notification */}
+      {toastMessage && (
+        <div className="fixed bottom-6 right-6 z-50 pointer-events-none animate-in fade-in slide-in-from-bottom-2 duration-200">
+          <div className="pointer-events-auto flex items-center gap-2 px-4 py-2.5 rounded-2xl bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900 text-xs font-medium shadow-xl border border-zinc-800 dark:border-zinc-200">
+            <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0" />
+            <span>{toastMessage}</span>
+          </div>
+        </div>
       )}
     </div>
   );
