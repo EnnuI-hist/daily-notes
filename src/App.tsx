@@ -21,7 +21,7 @@ import {
 } from './services/gistSync';
 import { SyncModal } from './components/SyncModal';
 import { DatePickerPopover } from './components/DatePickerPopover';
-import { formatDateBadge, isDateOverdue } from './utils/date';
+import { formatDateBadge, isDateOverdue, timestampToDateString, formatArchiveDayHeader } from './utils/date';
 
 const TASKS_STORAGE_KEY = 'mindflow_minimal_tasks_v2';
 const SYNC_CONFIG_KEY = 'mindflow_sync_config_v1';
@@ -320,7 +320,7 @@ export function App() {
     const now = Date.now();
     setTasks(prev =>
       prev.map(t =>
-        t.id === id ? { ...t, completed: false, updatedAt: now } : t
+        t.id === id ? { ...t, completed: false, completedAt: undefined, updatedAt: now } : t
       )
     );
     schedulePush();
@@ -706,69 +706,105 @@ export function App() {
               <span>Архив ({archivedTasks.length})</span>
             </button>
 
-            {/* Collapsed Archive Items */}
-            {showArchive && (
-              <div className="mt-3 flex flex-col gap-1 animate-in fade-in slide-in-from-top-1 duration-200">
-                {archivedTasks.map(task => {
-                  const isConfirming = confirmingDeleteId === task.id;
+            {showArchive && (() => {
+              // Sort archived tasks newest completedAt first; fallback to updatedAt then createdAt
+              const sorted = [...archivedTasks].sort((a, b) => {
+                const ta = a.completedAt ?? a.updatedAt ?? a.createdAt;
+                const tb = b.completedAt ?? b.updatedAt ?? b.createdAt;
+                return tb - ta;
+              });
 
-                  return (
-                    <div
-                      key={task.id}
-                      className="group flex items-start justify-between py-2 px-1 rounded-lg text-zinc-400 dark:text-zinc-600 hover:bg-zinc-100/40 dark:hover:bg-zinc-900/20 transition-colors"
-                    >
-                      <div className="flex items-start gap-3.5 min-w-0 flex-1">
-                        {/* Checkbox (Click to restore) */}
-                        <button
-                          type="button"
-                          onClick={() => handleRestore(task.id)}
-                          className="mt-0.5 shrink-0 w-4.5 h-4.5 rounded-full bg-zinc-200 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700 flex items-center justify-center cursor-pointer hover:bg-zinc-300 dark:hover:bg-zinc-700 transition-colors"
-                          title="Вернуть в активные"
-                        >
-                          <Check className="w-3 h-3 text-zinc-500 dark:text-zinc-400 stroke-[2.5]" />
-                        </button>
+              // Group by local date string YYYY-MM-DD
+              const groups: { dateStr: string; tasks: typeof sorted }[] = [];
+              for (const task of sorted) {
+                const ts = task.completedAt ?? task.updatedAt ?? task.createdAt;
+                const dateStr = timestampToDateString(ts);
+                const existing = groups.find(g => g.dateStr === dateStr);
+                if (existing) {
+                  existing.tasks.push(task);
+                } else {
+                  groups.push({ dateStr, tasks: [task] });
+                }
+              }
 
-                        <div className="flex-1 min-w-0">
-                          <span className="text-sm line-through break-words text-zinc-400 dark:text-zinc-600">
-                            {task.text}
-                          </span>
-                          {task.dueDate && (
-                            <div className="mt-0.5 text-[11px] text-zinc-400 dark:text-zinc-600 flex items-center gap-1 select-none">
-                              <Calendar className="w-3 h-3" />
-                              <span>{formatDateBadge(task.dueDate)}</span>
-                            </div>
-                          )}
-                        </div>
+              return (
+                <div className="mt-3 flex flex-col gap-5 animate-in fade-in slide-in-from-top-1 duration-200">
+                  {groups.map(({ dateStr, tasks: groupTasks }) => (
+                    <div key={dateStr}>
+                      {/* Day header */}
+                      <div className="flex items-center gap-2 mb-2 select-none">
+                        <span className="text-[11px] font-semibold uppercase tracking-widest text-zinc-400 dark:text-zinc-500">
+                          {formatArchiveDayHeader(dateStr)}
+                        </span>
+                        <div className="flex-1 h-px bg-zinc-100 dark:bg-zinc-800/80" />
                       </div>
 
-                      {/* Archive Delete Button with 2-click Confirmation */}
-                      {isConfirming ? (
-                        <button
-                          type="button"
-                          data-delete-btn
-                          onClick={e => executeDelete(task.id, e)}
-                          className="flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-semibold bg-rose-50 text-rose-600 dark:bg-rose-950/70 dark:text-rose-400 border border-rose-200 dark:border-rose-900/80 hover:bg-rose-100 dark:hover:bg-rose-900/60 transition-all cursor-pointer shadow-2xs animate-in fade-in zoom-in-95 duration-150 select-none shrink-0 ml-2"
-                          title="Нажмите ещё раз для подтверждения удаления навсегда"
-                        >
-                          <Check className="w-3 h-3 stroke-[3]" />
-                          <span>Удалить?</span>
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          data-delete-btn
-                          onClick={e => handleStartDelete(task.id, e)}
-                          className="opacity-0 group-hover:opacity-100 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 p-1 rounded transition-opacity cursor-pointer shrink-0 ml-2"
-                          title="Удалить навсегда"
-                        >
-                          <X className="w-3.5 h-3.5" />
-                        </button>
-                      )}
+                      {/* Tasks in this group */}
+                      <div className="flex flex-col gap-0.5">
+                        {groupTasks.map(task => {
+                          const isConfirming = confirmingDeleteId === task.id;
+
+                          return (
+                            <div
+                              key={task.id}
+                              className="group flex items-start justify-between py-2 px-1 rounded-lg text-zinc-400 dark:text-zinc-600 hover:bg-zinc-100/40 dark:hover:bg-zinc-900/20 transition-colors"
+                            >
+                              <div className="flex items-start gap-3.5 min-w-0 flex-1">
+                                {/* Checkbox (Click to restore) */}
+                                <button
+                                  type="button"
+                                  onClick={() => handleRestore(task.id)}
+                                  className="mt-0.5 shrink-0 w-4.5 h-4.5 rounded-full bg-zinc-200 dark:bg-zinc-800 border border-zinc-300 dark:border-zinc-700 flex items-center justify-center cursor-pointer hover:bg-zinc-300 dark:hover:bg-zinc-700 transition-colors"
+                                  title="Вернуть в активные"
+                                >
+                                  <Check className="w-3 h-3 text-zinc-500 dark:text-zinc-400 stroke-[2.5]" />
+                                </button>
+
+                                <div className="flex-1 min-w-0">
+                                  <span className="text-sm line-through break-words text-zinc-400 dark:text-zinc-600">
+                                    {task.text}
+                                  </span>
+                                  {task.dueDate && (
+                                    <div className="mt-0.5 text-[11px] text-zinc-400 dark:text-zinc-600 flex items-center gap-1 select-none">
+                                      <Calendar className="w-3 h-3" />
+                                      <span>{formatDateBadge(task.dueDate)}</span>
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+
+                              {/* Archive Delete Button with 2-click Confirmation */}
+                              {isConfirming ? (
+                                <button
+                                  type="button"
+                                  data-delete-btn
+                                  onClick={e => executeDelete(task.id, e)}
+                                  className="flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-semibold bg-rose-50 text-rose-600 dark:bg-rose-950/70 dark:text-rose-400 border border-rose-200 dark:border-rose-900/80 hover:bg-rose-100 dark:hover:bg-rose-900/60 transition-all cursor-pointer shadow-2xs animate-in fade-in zoom-in-95 duration-150 select-none shrink-0 ml-2"
+                                  title="Нажмите ещё раз для подтверждения удаления навсегда"
+                                >
+                                  <Check className="w-3 h-3 stroke-[3]" />
+                                  <span>Удалить?</span>
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  data-delete-btn
+                                  onClick={e => handleStartDelete(task.id, e)}
+                                  className="opacity-0 group-hover:opacity-100 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 p-1 rounded transition-opacity cursor-pointer shrink-0 ml-2"
+                                  title="Удалить навсегда"
+                                >
+                                  <X className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
                     </div>
-                  );
-                })}
-              </div>
-            )}
+                  ))}
+                </div>
+              );
+            })()}
           </div>
         </footer>
       )}
