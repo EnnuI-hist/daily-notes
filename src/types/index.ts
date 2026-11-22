@@ -6,6 +6,7 @@ export interface Task {
   completedAt?: number;
   updatedAt: number;
   deleted?: boolean;
+  dueDate?: string | null; // YYYY-MM-DD format
 }
 
 export type SyncStatus = 'offline' | 'synced' | 'syncing' | 'error';
