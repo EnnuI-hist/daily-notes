@@ -1,22 +1,28 @@
-import type { Task, SyncConfig } from '../types';
+import type { Task, Note, SyncConfig } from '../types';
 
 const GIST_FILENAME = 'mindflow-data.json';
 const GIST_API_BASE = 'https://api.github.com/gists';
 
-interface GistPayload {
+export interface GistPayload {
   version: number;
   lastSyncedAt: number;
   tasks: Task[];
+  notes?: Note[];
 }
 
 /**
- * Creates a new secret/private GitHub Gist to store MindFlow tasks.
+ * Creates a new secret/private GitHub Gist to store MindFlow tasks & notes.
  */
-export async function createPrivateGist(token: string, tasks: Task[]): Promise<string> {
+export async function createPrivateGist(
+  token: string,
+  tasks: Task[],
+  notes: Note[] = []
+): Promise<string> {
   const payload: GistPayload = {
-    version: 1,
+    version: 2,
     lastSyncedAt: Date.now(),
     tasks,
+    notes,
   };
 
   const response = await fetch(GIST_API_BASE, {
@@ -28,7 +34,7 @@ export async function createPrivateGist(token: string, tasks: Task[]): Promise<s
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      description: 'MindFlow Cloud Sync (Private Storage)',
+      description: 'MindFlow Cloud Sync (Private Storage: Tasks & Notes)',
       public: false,
       files: {
         [GIST_FILENAME]: {
@@ -48,9 +54,11 @@ export async function createPrivateGist(token: string, tasks: Task[]): Promise<s
 }
 
 /**
- * Fetches tasks from an existing Gist.
+ * Fetches all tasks and notes from an existing Gist.
  */
-export async function fetchGistTasks(config: SyncConfig): Promise<Task[]> {
+export async function fetchGistData(
+  config: SyncConfig
+): Promise<{ tasks: Task[]; notes: Note[] }> {
   const response = await fetch(`${GIST_API_BASE}/${config.gistId.trim()}`, {
     method: 'GET',
     headers: {
@@ -74,26 +82,42 @@ export async function fetchGistTasks(config: SyncConfig): Promise<Task[]> {
   const data = await response.json();
   const file = data.files?.[GIST_FILENAME];
   if (!file || !file.content) {
-    return [];
+    return { tasks: [], notes: [] };
   }
 
   try {
     const parsed: GistPayload = JSON.parse(file.content);
-    return Array.isArray(parsed.tasks) ? parsed.tasks : [];
+    return {
+      tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [],
+      notes: Array.isArray(parsed.notes) ? parsed.notes : [],
+    };
   } catch (err) {
     console.error('Failed to parse Gist content', err);
-    return [];
+    return { tasks: [], notes: [] };
   }
 }
 
 /**
- * Updates an existing Gist with local tasks.
+ * Legacy helper to fetch tasks.
  */
-export async function updateGistTasks(config: SyncConfig, tasks: Task[]): Promise<void> {
+export async function fetchGistTasks(config: SyncConfig): Promise<Task[]> {
+  const data = await fetchGistData(config);
+  return data.tasks;
+}
+
+/**
+ * Updates an existing Gist with local tasks and notes.
+ */
+export async function updateGistData(
+  config: SyncConfig,
+  tasks: Task[],
+  notes: Note[] = []
+): Promise<void> {
   const payload: GistPayload = {
-    version: 1,
+    version: 2,
     lastSyncedAt: Date.now(),
     tasks,
+    notes,
   };
 
   const response = await fetch(`${GIST_API_BASE}/${config.gistId.trim()}`, {
@@ -105,7 +129,7 @@ export async function updateGistTasks(config: SyncConfig, tasks: Task[]): Promis
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      description: 'MindFlow Cloud Sync (Private Storage)',
+      description: 'MindFlow Cloud Sync (Private Storage: Tasks & Notes)',
       files: {
         [GIST_FILENAME]: {
           content: JSON.stringify(payload, null, 2),
@@ -118,6 +142,13 @@ export async function updateGistTasks(config: SyncConfig, tasks: Task[]): Promis
     const errorData = await response.json().catch(() => ({}));
     throw new Error(errorData.message || `Ошибка сохранения в Gist (${response.status})`);
   }
+}
+
+/**
+ * Legacy helper to update tasks only.
+ */
+export async function updateGistTasks(config: SyncConfig, tasks: Task[]): Promise<void> {
+  return updateGistData(config, tasks, []);
 }
 
 /**
@@ -152,6 +183,43 @@ export function mergeTasks(local: Task[], remote: Task[]): Task[] {
   return Array.from(map.values()).sort((a, b) => {
     // Keep active before completed, then sort by createdAt descending
     if (a.completed !== b.completed) return a.completed ? 1 : -1;
+    return (b.createdAt || 0) - (a.createdAt || 0);
+  });
+}
+
+/**
+ * Merges two note arrays using Last-Write-Wins (LWW) based on updatedAt / createdAt.
+ */
+export function mergeNotes(local: Note[], remote: Note[]): Note[] {
+  const map = new Map<string, Note>();
+
+  // Add all local notes
+  for (const n of local) {
+    map.set(n.id, {
+      ...n,
+      updatedAt: n.updatedAt || n.createdAt || Date.now(),
+    });
+  }
+
+  // Merge remote notes
+  for (const r of remote) {
+    const remoteUpdated = r.updatedAt || r.createdAt || Date.now();
+    const existing = map.get(r.id);
+
+    if (!existing) {
+      map.set(r.id, { ...r, updatedAt: remoteUpdated });
+    } else {
+      const localUpdated = existing.updatedAt || existing.createdAt || 0;
+      if (remoteUpdated >= localUpdated) {
+        map.set(r.id, { ...r, updatedAt: remoteUpdated });
+      }
+    }
+  }
+
+  return Array.from(map.values()).sort((a, b) => {
+    // Pinned notes first
+    if (Boolean(a.pinned) !== Boolean(b.pinned)) return a.pinned ? -1 : 1;
+    // Then newest first
     return (b.createdAt || 0) - (a.createdAt || 0);
   });
 }
